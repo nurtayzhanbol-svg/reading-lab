@@ -173,7 +173,7 @@ def add_link(conn, src, dst, relation, note=None, score=None, origin="auto"):
                  " VALUES (?,?,?,?,?,?)", (src, dst, relation, note, score, origin))
 
 
-def link_article(conn, article_id, max_links=2):
+def link_article(conn, article_id, max_links=1, max_pair=2):
     """Connect this article's observations to observations in other articles.
     Links always point from the older observation to the newer one."""
     conn.execute("DELETE FROM observation_links WHERE origin='auto' AND (src_id IN (SELECT id FROM observations "
@@ -182,24 +182,39 @@ def link_article(conn, article_id, max_links=2):
     mine = _current_obs(conn, "o.article_id=?", (article_id,))
     others = _current_obs(conn, "o.article_id!=?", (article_id,))
     ov = [(p, from_blob(p["embedding"])) for p in others]
+    cands = []
     for o in mine:
         v = from_blob(o["embedding"])
-        cands = []
         for p, pv in ov:
             sim = cosine(v, pv)
             same = o["signal_key"] and o["signal_key"] == p["signal_key"]
-            if not ((same and sim >= 0.2) or sim >= 0.6):
+            if not (same or sim >= 0.6):
                 continue
-            cands.append((sim + (0.3 if same else 0), sim, same, p))
-        cands.sort(key=lambda c: -c[0])
-        for score, sim, same, p in cands[:max_links]:
-            old, new = (p, o) if (p["date"] or "") <= (o["date"] or "") else (o, p)
-            if conn.execute("SELECT 1 FROM observation_links WHERE (src_id=? AND dst_id=?) OR (src_id=? AND dst_id=?)",
-                            (old["id"], new["id"], new["id"], old["id"])).fetchone():
-                continue
-            rel, note = _relation(old, new, same, sim)
-            if rel:
-                add_link(conn, old["id"], new["id"], rel, note, round(score, 3))
+            near = 1 / (1 + abs(_days(o["date"], p["date"])) / 30)
+            cands.append((sim + (0.3 + 0.1 * near if same else 0), sim, same, o, p))
+    cands.sort(key=lambda c: -c[0])
+    per_obs, per_pair = {}, {}
+    for score, sim, same, o, p in cands:
+        pair = p["article_id"]
+        if per_obs.get(o["id"], 0) >= max_links or per_pair.get(pair, 0) >= max_pair:
+            continue
+        old, new = (p, o) if (p["date"] or "") <= (o["date"] or "") else (o, p)
+        if conn.execute("SELECT 1 FROM observation_links WHERE (src_id=? AND dst_id=?) OR (src_id=? AND dst_id=?)",
+                        (old["id"], new["id"], new["id"], old["id"])).fetchone():
+            continue
+        rel, note = _relation(old, new, same, sim)
+        if rel:
+            add_link(conn, old["id"], new["id"], rel, note, round(score, 3))
+            per_obs[o["id"]] = per_obs.get(o["id"], 0) + 1
+            per_pair[pair] = per_pair.get(pair, 0) + 1
+
+
+def _days(a, b):
+    from datetime import date
+    try:
+        return (date.fromisoformat(a[:10]) - date.fromisoformat(b[:10])).days
+    except (TypeError, ValueError):
+        return 365
 
 
 def _relation(old, new, same_signal, sim):
